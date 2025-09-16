@@ -1,0 +1,253 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>TTS (spec-compliant)</title>
+<style>
+  body{font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px}
+  .row{margin-bottom:10px}
+  input[type=text]{width:520px}
+  textarea{width:520px;height:100px}
+  #caps{
+    white-space: pre-wrap;     /* keep quotes/brackets visible */
+    overflow-wrap: anywhere;   /* wrap long JSON tokens */
+    word-break: break-word;    /* legacy alias; fine to keep */
+    background:#f6f6f6; padding:8px; border-radius:8px; min-height:3em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  #status{margin-left:8px;color:#555}
+</style>
+
+<h2>TTS WebSocket Client</h2>
+<div class="row">
+  <input id="url" type="text" placeholder="ws(s)://host/ws" />
+  <button id="connect">Connect</button>
+  <button id="speak">Speak</button>
+
+  <label style="margin-left:12px">
+    Words/chunk:
+    <input id="wpc" type="number" min="1" value="3" style="width:60px">
+  </label>
+  <button id="speakChunked">Speak (chunked)</button>
+  <button id="speakPunct">Speak (punct-only)</button>
+
+  <button id="end">End</button>
+  <span id="status">[disconnected]</span>
+</div>
+
+<div class="row">
+  <textarea id="text" rows="3" cols="70" placeholder="Type text here..."></textarea>
+</div>
+
+<h3>Captions</h3>
+<div id="caps"></div>
+
+<script>
+"use strict";
+
+let ws, ctx;
+let playhead = 0;
+
+// punctuation boundaries (English + common CJK)
+const PUNCT_RE = /[.!?;:,…，。？！；：、]/;
+
+const $ = id => document.getElementById(id);
+
+function relWsURL(){
+  const p = location.protocol === "https:" ? "wss" : "ws";
+  return p + "://" + location.host + "/ws";
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  const u = $("url");
+  if (u && !u.value) u.value = relWsURL();
+});
+
+async function ensureAudio(){
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+  if (ctx.state === "suspended") await ctx.resume();
+  if (playhead === 0) playhead = ctx.currentTime;
+}
+
+// trim leading/trailing near-silence on Int16 PCM
+function trimPCM16(pcm, thresh = 3) {
+  let s = 0, e = pcm.length - 1;
+  while (s < pcm.length && Math.abs(pcm[s]) <= thresh) s++;
+  while (e >= s && Math.abs(pcm[e]) <= thresh) e--;
+  return s > e ? new Int16Array(0) : pcm.subarray(s, e + 1);
+}
+
+function playPcm16Mono44100(b64){
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+  if (playhead === 0) playhead = ctx.currentTime;
+
+  // decode base64 -> Int16
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const view  = new DataView(bytes.buffer);
+  const N = bytes.byteLength >> 1;
+  const pcm = new Int16Array(N);
+  for (let i = 0; i < N; i++) pcm[i] = view.getInt16(i*2, true);
+
+  // trim head/tail near-silence
+  const trimmed = trimPCM16(pcm);
+  if (trimmed.length === 0) return;
+
+  // Int16 -> Float32
+  const f32 = new Float32Array(trimmed.length);
+  for (let i = 0; i < trimmed.length; i++) {
+    f32[i] = Math.max(-1, Math.min(1, trimmed[i] / 32767));
+  }
+
+  // make AudioBuffer
+  const buf = ctx.createBuffer(1, f32.length, 44100);
+  buf.copyToChannel(f32, 0, 0);
+
+  // schedule sequential playback with a tight guard (3ms)
+  const now = ctx.currentTime;
+  if (playhead < now) playhead = now;
+  const startAt = Math.max(playhead, now + 0.003);
+  const endAt   = startAt + buf.duration;
+
+  // tiny fades to avoid clicks
+  const gn = ctx.createGain();
+  gn.gain.setValueAtTime(0, startAt);
+  gn.gain.linearRampToValueAtTime(1, startAt + 0.005);
+  gn.gain.setValueAtTime(1, endAt - 0.005);
+  gn.gain.linearRampToValueAtTime(0, endAt);
+
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(gn);
+  gn.connect(ctx.destination);
+  src.start(startAt);
+
+  playhead = endAt;
+}
+
+// Grapheme-aware splitter (handles emoji/accents). Falls back to Array.from.
+const GRAPHEME_SEG = (window.Intl && Intl.Segmenter)
+  ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+  : null;
+
+function splitGraphemes(str) {
+  if (GRAPHEME_SEG) return Array.from(GRAPHEME_SEG.segment(str), s => s.segment);
+  return Array.from(str);
+}
+
+// ONLY split at punctuation (no word-count fallback)
+function chunkByPunctOnly(text, punctRe = PUNCT_RE) {
+  const tokens = String(text).trim().split(/\s+/);
+  const chunks = [];
+  let cur = [];
+  for (const tk of tokens) {
+    cur.push(tk);
+    if (punctRe.test(tk.slice(-1))) {
+      chunks.push(cur.join(" ") + " ");
+      cur = [];
+    }
+  }
+  if (cur.length) chunks.push(cur.join(" ") + " ");
+  return chunks;
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function setStatus(s){ $("status").textContent = s; }
+
+// Connect
+$("connect").onclick = async () => {
+  await ensureAudio();
+  playhead = ctx.currentTime;
+
+  if (ws) { try { ws.close(); } catch {} }
+  const url = $("url").value.trim();
+
+  // simple validation without regex (prevents the regex error)
+  try { new URL(url); } catch { alert("Invalid URL"); return; }
+  const okScheme = url.startsWith("ws://") || url.startsWith("wss://");
+  const okPath   = url.endsWith("/ws");
+  if (!okScheme || !okPath) { alert("URL must start with ws:// or wss:// and end with /ws"); return; }
+
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    setStatus("[connected]");
+    ws.send(JSON.stringify({ text: " ", flush: false })); // prime
+  };
+  ws.onclose = () => setStatus("[disconnected]");
+  ws.onerror = e => { setStatus("[error]"); console.error("ws error", e); };
+  ws.onmessage = (e) => {
+  let m; try { m = JSON.parse(e.data); } catch { return; }
+
+  // play audio if present
+  if (typeof m.audio === "string" && m.audio) {
+    playPcm16Mono44100(m.audio);
+  }
+
+  if (m.alignment !== undefined) {
+  $("caps").textContent = (typeof m.alignment === "string")
+    ? m.alignment
+    : JSON.stringify(m.alignment);  // no pretty-printing
+  }
+};
+
+};
+
+// Speak (single flush)
+$("speak").onclick = async () => {
+  if (!ws || ws.readyState !== 1) return alert("Connect first");
+  await ensureAudio();
+  playhead = Math.max(playhead, ctx.currentTime);
+
+  const text = $("text").value.trim();
+  if (!text) return;
+
+  ws.send(JSON.stringify({ text, flush: true }));
+};
+
+// Speak (chunked by N words)
+$("speakChunked").onclick = async () => {
+  if (!ws || ws.readyState !== 1) return alert("Connect first");
+  await ensureAudio();
+  playhead = Math.max(playhead, ctx.currentTime);
+
+  const text = $("text").value.trim();
+  if (!text) return;
+
+  const N = Math.max(1, parseInt($("wpc").value || "1", 10));
+  const words = text.split(/\s+/);
+
+  ws.send(JSON.stringify({ text: " ", flush: false })); // prime
+
+  for (let i = 0; i < words.length; i += N) {
+    const chunk = words.slice(i, i + N).join(" ") + " ";
+    ws.send(JSON.stringify({ text: chunk, flush: true }));
+    // await sleep(10); // optional tiny throttle
+  }
+  ws.send(JSON.stringify({ text: "", flush: false })); // end
+};
+
+// Speak (punctuation-only)
+$("speakPunct").onclick = async () => {
+  if (!ws || ws.readyState !== 1) return alert("Connect first");
+  await ensureAudio();
+  playhead = Math.max(playhead, ctx.currentTime);
+
+  const text = $("text").value.trim();
+  if (!text) return;
+
+  const chunks = chunkByPunctOnly(text);
+
+  ws.send(JSON.stringify({ text: " ", flush: false })); // prime
+  for (const c of chunks) {
+    ws.send(JSON.stringify({ text: c, flush: true }));
+    // await sleep(10); // optional tiny throttle
+  }
+  ws.send(JSON.stringify({ text: "", flush: false }));  // end
+};
+
+// End
+$("end").onclick = () => {
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({ text: "", flush: false })); } catch {}
+    try { ws.close(); } catch {}
+  }
+  if (ctx) playhead = ctx.currentTime;
+};
+</script>
